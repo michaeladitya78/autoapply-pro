@@ -1,16 +1,18 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
-import { useAuth, UserButton } from "@clerk/nextjs";
+import { useAuth, UserButton, useUser } from "@clerk/nextjs";
 import CareerOpsTab from "./CareerOpsTab";
+import { OutreachTab, AnalyticsTab, SettingsTab } from "./DashboardTabs";
+import Link from "next/link";
 import {
   Bot, LayoutDashboard, Briefcase, Mail, Shield,
   AlertTriangle, BarChart3, Settings, ChevronRight,
-  Play, Pause, RefreshCw, Bell, Zap, TrendingUp,
-  CheckCircle2, XCircle, Clock, Eye, Search,
-  Target, FileText, GitBranch, Send, Star, PlusCircle
+  Play, Pause, RefreshCw, Zap, TrendingUp,
+  CheckCircle2, XCircle, Clock, Eye, ArrowRight,
+  Target, Download, X, ExternalLink,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from "recharts";
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, AreaChart, Area, XAxis, YAxis } from "recharts";
 import { format } from "date-fns";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
@@ -36,15 +38,20 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; className: s
 
 export default function DashboardClient({ userId }: { userId: string }) {
   const { getToken } = useAuth();
+  const { user } = useUser();
   const [activeTab, setActiveTab] = useState("overview");
   const [stats, setStats] = useState<any>(null);
   const [applications, setApplications] = useState<any[]>([]);
   const [activityFeed, setActivityFeed] = useState<any[]>([]);
+  const [outreachContacts, setOutreachContacts] = useState<any[]>([]);
+  const [outreachEmails, setOutreachEmails] = useState<any[]>([]);
   const [flags, setFlags] = useState<any[]>([]);
   const [accounts, setAccounts] = useState<any[]>([]);
   const [agentStatus, setAgentStatus] = useState<string>("idle");
   const [loading, setLoading] = useState(true);
   const [agentLoading, setAgentLoading] = useState(false);
+  const [isNewUser, setIsNewUser] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
 
   const fetchWithAuth = useCallback(async (endpoint: string) => {
     const token = await getToken();
@@ -59,7 +66,7 @@ export default function DashboardClient({ userId }: { userId: string }) {
     try {
       const [st, apps, feed, fl, accts, agStatus] = await Promise.all([
         fetchWithAuth("/api/dashboard/stats"),
-        fetchWithAuth("/api/applications?limit=20"),
+        fetchWithAuth("/api/applications?limit=50"),
         fetchWithAuth("/api/dashboard/activity-feed?limit=15"),
         fetchWithAuth("/api/flags?status=pending"),
         fetchWithAuth("/api/accounts"),
@@ -71,11 +78,26 @@ export default function DashboardClient({ userId }: { userId: string }) {
       setFlags(fl);
       setAccounts(accts);
       setAgentStatus(agStatus.status);
-    } catch (err) {
+      setApiError(null);
+      // Detect new user: no applications and no resume
+      if (!apps?.length && !st?.resume_uploaded) setIsNewUser(true);
+    } catch (err: any) {
       console.error("Dashboard load error:", err);
+      setApiError("Could not reach the AutoApply backend. Is it running on port 8080?");
     } finally {
       setLoading(false);
     }
+  }, [fetchWithAuth]);
+
+  const loadOutreach = useCallback(async () => {
+    try {
+      const [contacts, emails] = await Promise.all([
+        fetchWithAuth("/api/outreach/contacts"),
+        fetchWithAuth("/api/outreach/emails"),
+      ]);
+      setOutreachContacts(contacts);
+      setOutreachEmails(emails);
+    } catch { /* silent on outreach load fail */ }
   }, [fetchWithAuth]);
 
   useEffect(() => {
@@ -86,19 +108,31 @@ export default function DashboardClient({ userId }: { userId: string }) {
 
   // WebSocket for real-time updates
   useEffect(() => {
-    const ws = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/${userId}`);
+    const wsUrl = process.env.NEXT_PUBLIC_WS_URL;
+    if (!wsUrl) return;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(`${wsUrl}/ws/${userId}`);
+    } catch { return; }
     const ping = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 25000);
     ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === "application_submitted") {
-        setActivityFeed(prev => [{ type: "application_submitted", details: msg.payload, timestamp: new Date().toISOString() }, ...prev.slice(0, 29)]);
-        loadDashboard();
-      } else if (msg.type === "human_flag") {
-        setFlags(prev => [{ ...msg.payload, id: Date.now(), created_at: new Date().toISOString() }, ...prev]);
-      }
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "application_submitted") {
+          setActivityFeed(prev => [{ type: "application_submitted", details: msg.payload, timestamp: new Date().toISOString() }, ...prev.slice(0, 29)]);
+          loadDashboard();
+        } else if (msg.type === "human_flag") {
+          setFlags(prev => [{ ...msg.payload, id: Date.now(), created_at: new Date().toISOString() }, ...prev]);
+        }
+      } catch { /* ignore malformed WS frames */ }
     };
-    return () => { clearInterval(ping); ws.close(); };
+    ws.onerror = () => console.warn("AutoApply WebSocket disconnected — real-time updates paused");
+    return () => { clearInterval(ping); try { ws.close(); } catch {} };
   }, [userId, loadDashboard]);
+
+  useEffect(() => {
+    if (activeTab === "outreach") loadOutreach();
+  }, [activeTab, loadOutreach]);
 
   const toggleAgent = async () => {
     setAgentLoading(true);
@@ -126,13 +160,22 @@ export default function DashboardClient({ userId }: { userId: string }) {
     { name: "Rejected", value: stats.applications?.by_status?.rejected || 0 },
   ] : [];
 
+  const weeklyData = stats?.weekly_trend || [];
+
   const COLORS = ["#818CF8", "#60A5FA", "#34D399", "#FBBF24", "#F87171"];
+
+  // Free tier: 20 apps/month limit
+  const FREE_APP_LIMIT = 20;
+  const FREE_EMAIL_LIMIT = 5;
+  const totalApps = stats?.applications?.total || 0;
+  const isFreeUser = !stats?.plan || stats.plan === "free";
+  const nearLimit = isFreeUser && totalApps >= FREE_APP_LIMIT * 0.8;
 
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
-        <div className="text-center">
-          <div className="w-12 h-12 rounded-xl bg-indigo-500/20 mx-auto mb-4 flex items-center justify-center shimmer" />
+        <div className="text-center space-y-4">
+          <div className="w-12 h-12 rounded-xl bg-indigo-500/20 mx-auto flex items-center justify-center shimmer" />
           <p className="text-white/40">Loading dashboard...</p>
         </div>
       </div>
@@ -200,10 +243,61 @@ export default function DashboardClient({ userId }: { userId: string }) {
 
       {/* Main */}
       <main className="relative z-10 flex-1 overflow-auto p-8">
+        {/* Backend offline warning */}
+        {apiError && (
+          <div className="mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-start gap-3">
+            <AlertTriangle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-medium text-amber-300">Backend offline</p>
+              <p className="text-xs text-white/50 mt-0.5">{apiError}</p>
+            </div>
+          </div>
+        )}
+
+        {/* New user onboarding nudge */}
+        {isNewUser && activeTab === "overview" && (
+          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
+            className="mb-6 p-5 rounded-xl border border-indigo-500/30 bg-indigo-500/08 flex items-center justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-lg bg-indigo-500/20 flex items-center justify-center shrink-0">
+                <Bot size={18} className="text-indigo-400" />
+              </div>
+              <div>
+                <p className="font-semibold text-sm">Welcome! Let's get your agent running ⚡</p>
+                <p className="text-xs text-white/45 mt-0.5">Upload your resume, set job preferences, and connect your first platform — takes 3 minutes.</p>
+              </div>
+            </div>
+            <Link href="/onboarding">
+              <button className="btn-primary text-sm px-5 py-2.5 flex items-center gap-2 shrink-0">
+                Start Setup <ArrowRight size={15} />
+              </button>
+            </Link>
+          </motion.div>
+        )}
+
+        {/* Free tier limit warning */}
+        {nearLimit && (
+          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
+            className="mb-6 p-4 rounded-xl border border-amber-500/30 bg-amber-500/08 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <AlertTriangle size={16} className="text-amber-400 shrink-0" />
+              <p className="text-sm text-amber-200">
+                You've used <strong>{totalApps}/{FREE_APP_LIMIT}</strong> free applications this month.
+                Upgrade to Pro for unlimited.
+              </p>
+            </div>
+            <Link href="/pricing">
+              <button className="text-xs font-bold px-4 py-2 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:bg-amber-500/30 transition-colors shrink-0">
+                Upgrade →
+              </button>
+            </Link>
+          </motion.div>
+        )}
+
         <AnimatePresence mode="wait">
           {activeTab === "overview" && (
             <motion.div key="overview" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-              <OverviewTab stats={stats} chartData={chartData} colors={COLORS} activityFeed={activityFeed} />
+              <OverviewTab stats={stats} chartData={chartData} weeklyData={weeklyData} colors={COLORS} activityFeed={activityFeed} />
             </motion.div>
           )}
           {activeTab === "applications" && (
@@ -221,9 +315,24 @@ export default function DashboardClient({ userId }: { userId: string }) {
               <FlagsTab flags={flags} />
             </motion.div>
           )}
+          {activeTab === "outreach" && (
+            <motion.div key="outreach" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+              <OutreachTab contacts={outreachContacts} emails={outreachEmails} />
+            </motion.div>
+          )}
+          {activeTab === "analytics" && (
+            <motion.div key="analytics" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+              <AnalyticsTab stats={stats} chartData={chartData} weeklyData={weeklyData} colors={COLORS} applications={applications} />
+            </motion.div>
+          )}
           {activeTab === "career-ops" && (
             <motion.div key="career-ops" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
               <CareerOpsTab getToken={getToken} userId={userId} />
+            </motion.div>
+          )}
+          {activeTab === "settings" && (
+            <motion.div key="settings" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+              <SettingsTab user={user} />
             </motion.div>
           )}
         </AnimatePresence>
@@ -232,7 +341,7 @@ export default function DashboardClient({ userId }: { userId: string }) {
   );
 }
 
-function OverviewTab({ stats, chartData, colors, activityFeed }: any) {
+function OverviewTab({ stats, chartData, weeklyData, colors, activityFeed }: any) {
   const metrics = [
     { label: "Total Applications", value: stats?.applications?.total ?? 0, icon: Briefcase, color: "text-indigo-400", bg: "bg-indigo-500/10" },
     { label: "This Week", value: stats?.applications?.this_week ?? 0, icon: TrendingUp, color: "text-emerald-400", bg: "bg-emerald-500/10" },
@@ -310,11 +419,38 @@ function OverviewTab({ stats, chartData, colors, activityFeed }: any) {
 
 function ApplicationsTab({ applications }: { applications: any[] }) {
   const [filter, setFilter] = useState<string>("all");
-  const filtered = filter === "all" ? applications : applications.filter(a => a.status === filter);
+  const [platformFilter, setPlatformFilter] = useState<string>("all");
+  const [selected, setSelected] = useState<any | null>(null);
+
+  const platforms = ["all", ...Array.from(new Set(applications.map(a => a.platform).filter(Boolean)))];
+  const filtered = applications
+    .filter(a => filter === "all" || a.status === filter)
+    .filter(a => platformFilter === "all" || a.platform === platformFilter);
+
+  const exportCSV = () => {
+    const headers = ["Company", "Role", "Platform", "Status", "Applied At", "URL"];
+    const rows = filtered.map(a => [
+      a.company, a.title, a.platform, a.status,
+      a.applied_at ? format(new Date(a.applied_at), "yyyy-MM-dd HH:mm") : "",
+      a.job_url || "",
+    ]);
+    const csv = [headers, ...rows].map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = "applications.csv"; a.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Applications</h1>
+    <div className="space-y-5">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Applications</h1>
+        <button onClick={exportCSV} className="btn-ghost py-2 px-4 text-sm flex items-center gap-2">
+          <Download size={14} /> Export CSV
+        </button>
+      </div>
+
+      {/* Status filter */}
       <div className="flex gap-2 flex-wrap">
         {["all", "applied", "viewed", "interview", "offer", "rejected"].map(s => (
           <button key={s} onClick={() => setFilter(s)}
@@ -323,6 +459,19 @@ function ApplicationsTab({ applications }: { applications: any[] }) {
           </button>
         ))}
       </div>
+
+      {/* Platform filter */}
+      {platforms.length > 2 && (
+        <div className="flex gap-2 flex-wrap">
+          {platforms.map(p => (
+            <button key={p} onClick={() => setPlatformFilter(p)}
+              className={`px-3 py-1.5 text-xs rounded-lg border transition-all capitalize ${platformFilter === p ? "bg-blue-500/20 border-blue-500/40 text-blue-300" : "border-white/08 text-white/40 hover:border-white/20"}`}>
+              {p}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="glass rounded-xl overflow-hidden">
         <table className="w-full">
           <thead>
@@ -336,7 +485,9 @@ function ApplicationsTab({ applications }: { applications: any[] }) {
             {filtered.length === 0 ? (
               <tr><td colSpan={5} className="text-center py-12 text-white/30">No applications found</td></tr>
             ) : filtered.map(app => (
-              <tr key={app.id} className="border-b border-white/05 hover:bg-white/02 transition-colors">
+              <tr key={app.id}
+                onClick={() => setSelected(app)}
+                className="border-b border-white/05 hover:bg-white/03 transition-colors cursor-pointer">
                 <td className="py-3 px-4 font-medium text-sm">{app.company}</td>
                 <td className="py-3 px-4 text-sm text-white/70">{app.title}</td>
                 <td className="py-3 px-4 text-sm text-white/50 capitalize">{app.platform}</td>
@@ -351,23 +502,82 @@ function ApplicationsTab({ applications }: { applications: any[] }) {
           </tbody>
         </table>
       </div>
+
+      {/* Detail side panel */}
+      <AnimatePresence>
+        {selected && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-end"
+            onClick={() => setSelected(null)}>
+            <motion.div initial={{ x: 400 }} animate={{ x: 0 }} exit={{ x: 400 }}
+              transition={{ type: "spring", damping: 25 }}
+              className="h-full w-full max-w-md glass border-l border-white/10 p-8 overflow-y-auto space-y-5"
+              onClick={e => e.stopPropagation()}>
+              <div className="flex items-start justify-between">
+                <div>
+                  <h2 className="text-xl font-bold">{selected.company}</h2>
+                  <p className="text-white/60 text-sm mt-0.5">{selected.title}</p>
+                </div>
+                <button onClick={() => setSelected(null)} className="text-white/30 hover:text-white transition-colors">
+                  <X size={20} />
+                </button>
+              </div>
+              <div className="space-y-3">
+                {[
+                  ["Platform", selected.platform],
+                  ["Status", selected.status],
+                  ["Applied", selected.applied_at ? format(new Date(selected.applied_at), "MMM d yyyy, HH:mm") : "Unknown"],
+                  ["Location", selected.location || "Not specified"],
+                  ["Salary", selected.salary_range || "Not listed"],
+                ].map(([label, val]) => (
+                  <div key={label} className="flex justify-between py-2 border-b border-white/05">
+                    <span className="text-sm text-white/40">{label}</span>
+                    <span className="text-sm capitalize">{val}</span>
+                  </div>
+                ))}
+              </div>
+              {selected.job_url && (
+                <a href={selected.job_url} target="_blank" rel="noopener noreferrer"
+                  className="btn-ghost w-full py-2.5 text-sm flex items-center justify-center gap-2">
+                  View Original Posting <ExternalLink size={14} />
+                </a>
+              )}
+              {selected.cover_letter && (
+                <div>
+                  <h3 className="text-sm font-semibold mb-2 text-white/60">Cover Letter Used</h3>
+                  <p className="text-xs text-white/50 leading-relaxed whitespace-pre-wrap">{selected.cover_letter}</p>
+                </div>
+              )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
 
 function AccountsTab({ accounts }: { accounts: any[] }) {
   const PLATFORMS = ["linkedin", "indeed", "naukri", "glassdoor", "wellfound", "dice", "ziprecruiter"];
+  const DAILY_LIMITS: Record<string, number> = { linkedin: 25, indeed: 30, naukri: 40, glassdoor: 20, wellfound: 15, dice: 25, ziprecruiter: 30 };
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Connected Accounts</h1>
-        <p className="text-white/40 text-sm mt-1">Browser sessions are encrypted — we never see your passwords</p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold">Connected Accounts</h1>
+          <p className="text-white/40 text-sm mt-1">Browser sessions are encrypted — we never see your passwords</p>
+        </div>
+        <div className="glass px-3 py-2 rounded-lg flex items-center gap-2 text-xs text-green-400 border border-green-500/20">
+          <Shield size={13} /> AES-256 encrypted
+        </div>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {PLATFORMS.map(platform => {
           const account = accounts.find(a => a.platform === platform);
           const isConnected = account?.status === "active";
+          const appsToday = account?.applications_today || 0;
+          const limit = DAILY_LIMITS[platform] || 20;
+          const pct = Math.min(100, (appsToday / limit) * 100);
           return (
             <div key={platform} className={`glass p-5 rounded-xl border ${isConnected ? "border-green-500/20" : "border-white/08"}`}>
               <div className="flex items-center justify-between mb-3">
@@ -377,10 +587,19 @@ function AccountsTab({ accounts }: { accounts: any[] }) {
                 </span>
               </div>
               {isConnected && (
-                <p className="text-xs text-white/40 mb-3">
-                  {account.applications_today} apps today
-                  {account.last_verified && ` · Verified ${format(new Date(account.last_verified), "MMM d")}`}
-                </p>
+                <div className="mb-3 space-y-1.5">
+                  <div className="flex justify-between text-xs text-white/40">
+                    <span>{appsToday} apps today</span>
+                    <span>limit: {limit}/day</span>
+                  </div>
+                  <div className="h-1.5 bg-white/08 rounded-full overflow-hidden">
+                    <div className="h-full rounded-full transition-all"
+                      style={{ width: `${pct}%`, background: pct > 80 ? "#F87171" : pct > 50 ? "#FBBF24" : "#34D399" }} />
+                  </div>
+                  {account.last_verified && (
+                    <p className="text-xs text-white/30">Verified {format(new Date(account.last_verified), "MMM d")}</p>
+                  )}
+                </div>
               )}
               <button className={isConnected ? "btn-ghost w-full py-2 text-sm" : "btn-primary w-full py-2 text-sm"}>
                 {isConnected ? "Manage Session" : "Connect Account"}

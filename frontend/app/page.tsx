@@ -151,6 +151,11 @@ export default function LandingPage() {
                   {tier.cta}
                 </button>
               </SignUpButton>
+              {tier.highlight && (
+                <Link href="/pricing">
+                  <button className="w-full text-xs text-white/30 hover:text-white/60 transition-colors mt-1">See full plan details →</button>
+                </Link>
+              )}
             </div>
           ))}
         </div>
@@ -158,11 +163,13 @@ export default function LandingPage() {
 
       {/* Footer */}
       <footer className="relative z-10 border-t border-white/08 mt-16 py-8 px-6 text-center text-white/30 text-sm space-y-2">
-        <p>© 2025 AutoApply Pro. Automated activity may violate third-party ToS — all risk is borne by the user.</p>
+        <p>© 2026 AutoApply Pro. Automated activity may violate third-party ToS — all risk is borne by the user.</p>
         <p className="flex items-center justify-center gap-4">
           <Link href="/terms" className="hover:text-white/60 transition-colors">Terms of Service</Link>
           <span>·</span>
           <Link href="/privacy" className="hover:text-white/60 transition-colors">Privacy Policy</Link>
+          <span>·</span>
+          <Link href="/pricing" className="hover:text-white/60 transition-colors">Pricing</Link>
         </p>
       </footer>
     </div>
