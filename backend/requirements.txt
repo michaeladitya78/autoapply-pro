@@ -1,0 +1,61 @@
+# ─── Core Framework ──────────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# ─── Task Queue ───────────────────────────────────────────────────────────────
+celery==5.4.0
+redis==5.2.0
+flower==2.0.1
+
+# ─── AI / LLMs ────────────────────────────────────────────────────────────────
+anthropic>=0.40.0          # Claude API
+langchain==0.3.9
+langchain-anthropic==0.3.3
+langgraph==0.2.55
+# crewai not installed — project uses LangGraph directly
+# chromadb runs in Docker — we call its HTTP API via httpx (no local install needed)
+# sentence-transformers requires C++ build tools on Windows — handled in Docker image only
+tiktoken==0.8.0
+openai==1.57.0             # for Ollama OpenAI-compat API
+
+# ─── Browser Automation ───────────────────────────────────────────────────────
+playwright==1.49.0
+playwright-stealth==1.0.6
+
+# ─── Auth & Security ──────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+svix==1.31.0            # Clerk webhook verification
+hvac==2.3.0             # HashiCorp Vault client
+cryptography==43.0.3
+bcrypt==4.2.1
+
+# ─── File Processing ──────────────────────────────────────────────────────────
+python-multipart==0.0.18
+pypdf2==3.0.1
+python-docx==1.1.2
+boto3==1.35.80          # S3 uploads
+
+# ─── Email ────────────────────────────────────────────────────────────────────
+aiosmtplib==3.0.2
+google-auth-oauthlib==1.2.1
+google-api-python-client==2.154.0
+
+# ─── HTTP & Scraping ──────────────────────────────────────────────────────────
+httpx==0.28.1
+aiohttp==3.11.10
+beautifulsoup4==4.12.3
+
+# ─── Utils ────────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1
+structlog==24.4.0
+prometheus-client==0.21.1
+pytz==2024.2
+python-dateutil==2.9.0
