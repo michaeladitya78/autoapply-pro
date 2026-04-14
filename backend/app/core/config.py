@@ -87,6 +87,14 @@ class Settings(BaseSettings):
                 return [o.strip() for o in v.split(",")]
         return v
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def format_database_url(cls, v):
+        """Auto-inject asyncpg driver if a standard postgresql:// URL is provided."""
+        if isinstance(v, str) and v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
+
     @field_validator("AES_ENCRYPTION_KEY", mode="before")
     @classmethod
     def pad_aes_key(cls, v):
