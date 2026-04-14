@@ -1,11 +1,19 @@
 """
 Browser Automation Engine — Stealth Playwright with Anti-Detection
 Core layer for all job platform interactions.
+
+Cloud deployment notes (Railway):
+  - Playwright Chromium is installed in the Docker image via `playwright install chromium --with-deps`
+  - All instances run headless (no X server on Railway)
+  - Browser profiles are stored as encrypted JSON in Supabase Vault (not local disk)
+  - Local /tmp is used as a throwaway user-data-dir per run, then discarded
+  - Brightdata Web Unlocker REST API pre-fetches pages that block automation
 """
 import asyncio
 import json
 import random
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 from playwright.async_api import async_playwright, BrowserContext, Page
@@ -14,6 +22,7 @@ import structlog
 from app.core.config import settings
 from app.core.encryption import encrypt, decrypt
 from app.core.vault import retrieve_session_data, store_session_data
+from app.core.brightdata import fetch_via_unlocker
 
 log = structlog.get_logger()
 
@@ -45,17 +54,24 @@ FINGERPRINT_POOL = [
 
 class StealthBrowserEngine:
     """
-    Manages persistent Chromium profiles per user with full stealth.
-    Handles session storage, restoration, and human-behavior simulation.
+    Manages stealth Chromium sessions per user.
+
+    Cloud (Railway):
+      - Chromium is installed in the Docker image.
+      - Each run uses a fresh temp dir — sessions are persisted via Supabase Vault.
+      - restore_session() loads cookies from Vault at start.
+      - save_session() persists cookies to Vault after each run.
+
+    Local dev:
+      - Same flow, but Vault falls back to in-memory store.
     """
 
     def __init__(self, user_id: str, platform: str, proxy_config: Optional[dict] = None):
         self.user_id = user_id
         self.platform = platform
-        self.proxy_config = proxy_config
         self.fingerprint = random.choice(FINGERPRINT_POOL)
-        self.profile_dir = Path(settings.BROWSER_PROFILES_PATH) / user_id / platform
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        # Use a throwaway temp dir per run — sessions are stored in Supabase, not disk
+        self._tmp_profile_dir: Optional[str] = None
         self._playwright = None
         self._browser = None
         self._context: Optional[BrowserContext] = None
@@ -68,39 +84,32 @@ class StealthBrowserEngine:
         await self.close()
 
     async def launch(self):
-        """Launch browser with stealth config and restored session."""
+        """Launch browser with stealth config. Sessions loaded separately via restore_session()."""
         self._playwright = await async_playwright().start()
+        # Create a temporary user-data dir for this run (discarded after close)
+        self._tmp_profile_dir = tempfile.mkdtemp(prefix=f"ap_{self.user_id[:8]}_")
 
         launch_args = [
             "--no-sandbox",
             "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
+            "--disable-dev-shm-usage",          # Required for Railway (shared /dev/shm)
+            "--disable-gpu",                    # No GPU on Railway
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
             "--window-size=1920,1080",
             f"--user-agent={self.fingerprint['userAgent']}",
         ]
 
-        proxy = None
-        if self.proxy_config:
-            proxy = {
-                "server": f"http://{self.proxy_config['host']}:{self.proxy_config['port']}",
-                "username": self.proxy_config["username"],
-                "password": self.proxy_config["password"],
-            }
-
         self._browser = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
+            user_data_dir=self._tmp_profile_dir,
             headless=True,
             args=launch_args,
-            proxy=proxy,
             viewport=self.fingerprint["viewport"],
             locale=self.fingerprint["locale"],
             timezone_id=self.fingerprint["timezoneId"],
             user_agent=self.fingerprint["userAgent"],
             java_script_enabled=True,
             accept_downloads=True,
-            # Anti-detection headers
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",
@@ -111,9 +120,20 @@ class StealthBrowserEngine:
         )
         self._context = self._browser
 
-        # Inject stealth scripts on every page
         await self._context.add_init_script(self._stealth_script())
-        log.info("Browser launched", user_id=self.user_id, platform=self.platform)
+        log.info("Browser launched", user_id=self.user_id, platform=self.platform, tmp_dir=self._tmp_profile_dir)
+
+    # ─── Brightdata Web Unlocker ────────────────────────────────────────────
+    async def brightdata_fetch(self, url: str, country: Optional[str] = None) -> str:
+        """
+        Fetch a URL's raw HTML via the Brightdata Web Unlocker REST API.
+        Use this for job listing pages that block automated access,
+        before handing the content to Claude or parsing selectors.
+        """
+        if not settings.brightdata_configured:
+            log.debug("Brightdata not configured, skipping unlocker fetch", url=url)
+            return ""
+        return await fetch_via_unlocker(url, country=country)
 
     def _stealth_script(self) -> str:
         """Anti-bot-detection JS injection."""
@@ -216,6 +236,13 @@ class StealthBrowserEngine:
             await self._browser.close()
         if self._playwright:
             await self._playwright.stop()
+        # Clean up temp profile dir
+        if self._tmp_profile_dir:
+            import shutil
+            try:
+                shutil.rmtree(self._tmp_profile_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     # ─── Human Behavior Simulation ─────────────────────────────────────────
     @staticmethod

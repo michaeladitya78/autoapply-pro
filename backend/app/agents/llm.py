@@ -1,26 +1,26 @@
 """
-LLM Integration — Claude API + Ollama
-======================================
+LLM Integration — Claude API (cloud-only)
+==========================================
 Resume tailoring, cover letter generation, cold email drafting,
 offer scoring, and job-fit analysis.
 
-Improvements v2:
+Cloud deployment: Ollama is not available on Railway workers.
+All LLM calls route through the Anthropic Claude API.
+
+Features:
   - Structured output with Pydantic models (prevents hallucination)
   - Exponential-backoff retry on rate-limit / server errors
-  - Model fallback chain: opus → sonnet → haiku
+  - Model fallback chain: sonnet → opus → haiku
   - Richer, role-aware system prompts to reduce generic AI-speak
-  - Full JSON schema enforcement via claude's tool_use feature
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import re
-import time
 from typing import Any
 
 import anthropic
-import httpx
 import structlog
 from pydantic import BaseModel, Field
 
@@ -518,48 +518,34 @@ Return JSON with these exact keys:
         return ParsedResume()
 
 
-# ─── Keyword Extraction (Ollama → Claude fallback) ────────────────────────────
-
-OLLAMA_MODEL = "mistral"
+# ─── Keyword Extraction (Claude-primary, regex fallback) ─────────────────────
+#
+# Ollama is not available in the cloud deployment (Railway).
+# Claude Haiku is used as the primary extractor — it's fast and cheap.
+# Regex heuristic is kept as a final fallback when the API is unreachable.
 
 
 async def ollama_chat(prompt: str, system: str = "", timeout: int = 60) -> str:
-    """General-purpose Ollama call for local, privacy-sensitive tasks."""
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{settings.OLLAMA_BASE_URL}/api/chat",
-                json={"model": OLLAMA_MODEL, "messages": messages, "stream": False},
-            )
-            response.raise_for_status()
-            return response.json()["message"]["content"]
-    except Exception as e:
-        log.warning("Ollama unavailable", error=str(e), model=OLLAMA_MODEL)
-        return ""
+    """
+    Stub retained for backward compatibility.
+    Ollama is not used in cloud deployment — always returns empty string.
+    Callers that previously used Ollama-first logic now fall through to Claude.
+    """
+    return ""
 
 
 async def extract_keywords(text: str) -> list[str]:
     """
     Extract top keywords from a job description.
-    Tries Ollama first (private/fast), falls back to Claude, then regex.
+    Primary: Claude Haiku (fast, cheap).
+    Fallback: regex heuristic.
     """
     prompt = (
         f"Extract the top 20 technical skills, tools, and keywords from this job description. "
         f"Return ONLY a JSON array of strings, no explanation:\n\n{text[:2000]}"
     )
-    # 1. Local Ollama (fastest, private)
-    result = await ollama_chat(prompt=prompt)
-    if result:
-        parsed = _extract_json(result, expect=list)
-        if isinstance(parsed, list) and parsed:
-            return [str(k) for k in parsed[:25]]
 
-    # 2. Claude fallback
+    # 1. Claude Haiku — primary
     try:
         raw = await _claude_with_retry(
             model="claude-haiku-4-5",
@@ -568,16 +554,20 @@ async def extract_keywords(text: str) -> list[str]:
             messages=[{"role": "user", "content": prompt}],
         )
         parsed = _extract_json(raw, expect=list)
-        if isinstance(parsed, list):
+        if isinstance(parsed, list) and parsed:
             return [str(k) for k in parsed[:25]]
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Claude keyword extraction failed, using regex fallback", error=str(e))
 
-    # 3. Regex heuristic (last resort)
+    # 2. Regex heuristic (last resort)
     keywords = re.findall(r"\b[A-Z][a-zA-Z+#]{2,}\b", text)
-    common = re.findall(r"\b(?:python|golang|react|typescript|aws|kubernetes|docker|postgresql|redis|fastapi|nextjs|llm|rag|ml|ai)\b", text.lower())
+    common = re.findall(
+        r"\b(?:python|golang|react|typescript|aws|kubernetes|docker|postgresql|"
+        r"redis|fastapi|nextjs|llm|rag|ml|ai)\b",
+        text.lower(),
+    )
     return list(set(keywords + [k.upper() for k in common]))[:20]
 
 
-# Backward-compat alias
+# Backward-compat alias (used by resume_service.py)
 ollama_extract_keywords = extract_keywords

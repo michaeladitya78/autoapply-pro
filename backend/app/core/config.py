@@ -1,64 +1,76 @@
-"""Application settings using Pydantic BaseSettings."""
+"""Application settings using Pydantic BaseSettings.
+
+Cloud deployment targets:
+  - PostgreSQL  → Supabase (DATABASE_URL)
+  - Redis       → Upstash  (REDIS_URL, prefix with rediss://)
+  - Vector DB   → Supabase pgvector (no separate service needed)
+  - Secrets     → Supabase Vault REST (SUPABASE_URL + SUPABASE_SERVICE_KEY)
+  - Email       → Resend API (RESEND_API_KEY)
+  - Payments    → Stripe (STRIPE_SECRET_KEY)
+  - LLM         → Anthropic Claude (ANTHROPIC_API_KEY)
+  - Browser     → Playwright headless inside Railway worker
+"""
 from functools import lru_cache
-from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List, Union
 import json
-import os
 
 
 class Settings(BaseSettings):
-    # App
+    # ─── App ──────────────────────────────────────────────────────────────────
     ENVIRONMENT: str = "development"
     SECRET_KEY: str = "AutoApplyPro2025DevSecretKey32!!"
     AES_ENCRYPTION_KEY: str = "AutoApplyPro2025SecretKey32Bytes"
 
-    # Database
+    # ─── Database (Supabase PostgreSQL) ───────────────────────────────────────
+    # Cloud:  postgresql+asyncpg://postgres:[pw]@db.[ref].supabase.co:5432/postgres
+    # Local:  postgresql+asyncpg://autoapply:supersecret_autoapply@localhost:5432/autoapply
     DATABASE_URL: str = "postgresql+asyncpg://autoapply:supersecret_autoapply@localhost:5432/autoapply"
     SYNC_DATABASE_URL: str = "postgresql://autoapply:supersecret_autoapply@localhost:5432/autoapply"
 
-    # Redis
+    # ─── Redis (Upstash — serverless, TLS) ────────────────────────────────────
+    # Cloud:  rediss://default:[token]@[host].upstash.io:6380
+    # Local:  redis://:redissecret_autoapply@localhost:6379/0
     REDIS_URL: str = "redis://:redissecret_autoapply@localhost:6379/0"
 
-    # ChromaDB
-    CHROMA_HOST: str = "http://localhost:8000"
+    # ─── Supabase (replaces ChromaDB + HashiCorp Vault) ───────────────────────
+    SUPABASE_URL: str = ""           # https://[ref].supabase.co
+    SUPABASE_SERVICE_KEY: str = ""   # Service role key (server-side only, never expose to browser)
 
-    # HashiCorp Vault
-    VAULT_ADDR: str = "http://localhost:8200"
-    VAULT_TOKEN: str = "myroot"
-
-    # AI
+    # ─── AI — Claude API only (Ollama removed) ────────────────────────────────
     ANTHROPIC_API_KEY: str = ""
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
 
-    # Auth (Clerk)
+    # ─── Auth (Clerk) ─────────────────────────────────────────────────────────
     CLERK_SECRET_KEY: str = ""
     CLERK_WEBHOOK_SECRET: str = ""
 
-    # Proxy (Brightdata) — optional, leave blank to skip proxy
-    BRIGHTDATA_USERNAME: str = ""
-    BRIGHTDATA_PASSWORD: str = ""
-    BRIGHTDATA_HOST: str = "brd.superproxy.io"
-    BRIGHTDATA_PORT: int = 22225
+    # ─── Brightdata Web Unlocker API (REST) ───────────────────────────────────
+    BRIGHTDATA_API_KEY: str = ""
+    BRIGHTDATA_ZONE: str = "web_unlocker1"
+    BRIGHTDATA_API_URL: str = "https://api.brightdata.com/request"
 
-    # Email
-    GMAIL_CLIENT_ID: str = ""
-    GMAIL_CLIENT_SECRET: str = ""
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
+    # ─── Email (Resend — replaces aiosmtplib / Gmail SMTP) ───────────────────
+    RESEND_API_KEY: str = ""
+    RESEND_FROM_EMAIL: str = "agent@autoapplypro.com"
 
-    # Contact Discovery
+    # ─── Payments (Stripe) ────────────────────────────────────────────────────
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_PRO_PRICE_ID: str = ""    # price_... from Stripe dashboard
+    STRIPE_TEAM_PRICE_ID: str = ""   # price_... from Stripe dashboard
+
+    # ─── Contact Discovery ────────────────────────────────────────────────────
     HUNTER_API_KEY: str = ""
     APOLLO_API_KEY: str = ""
 
-    # Storage (optional S3)
+    # ─── Storage (optional S3) ────────────────────────────────────────────────
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_BUCKET_NAME: str = "autoapply-resumes"
     AWS_REGION: str = "us-east-1"
 
-    # CORS — accepts JSON array string or Python list
+    # ─── CORS — accepts JSON array string or Python list ──────────────────────
     ALLOWED_ORIGINS: Union[List[str], str] = [
         "http://localhost:3000",
         "http://localhost:3001",
@@ -83,23 +95,45 @@ class Settings(BaseSettings):
             return v[:32].ljust(32, "0")
         return v
 
-    # Platform daily caps (anti-detection hard limits)
+    # ─── Platform daily caps (anti-detection hard limits) ─────────────────────
     LINKEDIN_DAILY_CAP: int = 25
     INDEED_DAILY_CAP: int = 40
     NAUKRI_DAILY_CAP: int = 30
 
-    # Browser profile storage path (local dev uses relative path)
-    BROWSER_PROFILES_PATH: str = "./browser_profiles"
+    # ─── Browser profile storage ──────────────────────────────────────────────
+    # In production (Railway), sessions are stored in Supabase, not local disk.
+    # This path is only used as a temporary scratch dir during a single run.
+    BROWSER_PROFILES_PATH: str = "/tmp/browser_profiles"
+
+    # ─── Computed properties ──────────────────────────────────────────────────
 
     @property
+    def brightdata_configured(self) -> bool:
+        """True if Brightdata Web Unlocker API key is set."""
+        return bool(self.BRIGHTDATA_API_KEY)
+
+    # Keep legacy alias for any code that still checks proxy_configured
+    @property
     def proxy_configured(self) -> bool:
-        """True if Brightdata credentials are set."""
-        return bool(self.BRIGHTDATA_USERNAME and self.BRIGHTDATA_PASSWORD)
+        return self.brightdata_configured
 
     @property
     def aes_key_bytes(self) -> bytes:
         """Return AES key as 32-byte value."""
         return self.AES_ENCRYPTION_KEY.encode()[:32].ljust(32, b"0")
+
+    @property
+    def supabase_configured(self) -> bool:
+        """True if Supabase URL + service key are both set."""
+        return bool(self.SUPABASE_URL and self.SUPABASE_SERVICE_KEY)
+
+    @property
+    def stripe_configured(self) -> bool:
+        return bool(self.STRIPE_SECRET_KEY)
+
+    @property
+    def resend_configured(self) -> bool:
+        return bool(self.RESEND_API_KEY)
 
     model_config = SettingsConfigDict(
         env_file=".env",

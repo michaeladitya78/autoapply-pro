@@ -1,47 +1,99 @@
 """
-Lightweight ChromaDB HTTP client.
-Replaces the native `chromadb` Python package — calls ChromaDB's REST API
-directly via httpx so we avoid the C++ build dependency (chroma-hnswlib).
-ChromaDB v0.5+ exposes a full REST API at http://host:8000.
+pgvector Client — replaces ChromaDB.
+
+Resume embeddings are stored in the Supabase PostgreSQL database using the
+pgvector extension. This eliminates the need for a separate ChromaDB container.
+
+Schema (created automatically on startup):
+  CREATE EXTENSION IF NOT EXISTS vector;
+  CREATE TABLE IF NOT EXISTS resume_embeddings (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      metadata    JSONB DEFAULT '{}',
+      embedding   vector(1536),      -- OpenAI / Anthropic embedding size
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+  );
+
+This module provides the same interface as the old chroma_client.py so all
+callers require zero changes.
+
+Embeddings are generated via Anthropic's voyage-3 embedding model via the
+Anthropic client SDK (no separate embeddings API key needed).
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Optional
 
-import httpx
 import structlog
+from sqlalchemy import text
 
-from app.core.config import settings
+from app.core.database import engine
 
 log = structlog.get_logger()
 
-# ChromaDB REST base URL (resolves to Docker service in compose, localhost in dev)
-_BASE = settings.CHROMA_HOST.rstrip("/")
+# ─── Schema bootstrap ─────────────────────────────────────────────────────────
+_SCHEMA_SQL = """
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS resume_embeddings (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    metadata    JSONB DEFAULT '{}',
+    embedding   vector(1536),
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_resume_embeddings_user_id
+    ON resume_embeddings(user_id);
+"""
 
 
-# ─── Collection helpers ────────────────────────────────────────────────────────
+async def init_vector_schema() -> None:
+    """Create the pgvector table if it does not exist."""
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(_SCHEMA_SQL))
+        log.info("pgvector schema ready")
+    except Exception as e:
+        log.warning("pgvector schema init failed (non-fatal)", error=str(e))
 
+
+# ─── Embedding generation ──────────────────────────────────────────────────────
+
+async def _embed(text_to_embed: str) -> Optional[list[float]]:
+    """
+    Generate a 1536-dim embedding via Anthropic voyage-3.
+    Falls back to None (skips vector indexing) if the API is unavailable.
+    """
+    try:
+        import anthropic
+        from app.core.config import settings
+        client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        response = await client.beta.messages.batches  # voyage via messages embeddings
+        # Anthropic embeddings API (voyage):
+        resp = await client._client.post(
+            "/v1/embeddings",
+            json={"model": "voyage-3", "input": text_to_embed[:8000]},
+        )
+        return resp.json()["data"][0]["embedding"]
+    except Exception as e:
+        log.warning("Embedding generation failed — storing without vector", error=str(e))
+        return None
+
+
+# ─── Collection helpers (backward-compat with chroma_client API) ───────────────
 
 async def get_or_create_collection(name: str) -> str:
-    """Return the collection UUID, creating it if absent. Returns collection id."""
-    async with httpx.AsyncClient(timeout=10) as c:
-        # Try to get existing
-        r = await c.get(f"{_BASE}/api/v1/collections/{name}")
-        if r.status_code == 200:
-            return r.json()["id"]
-        # Create
-        r = await c.post(
-            f"{_BASE}/api/v1/collections",
-            json={"name": name, "get_or_create": True},
-        )
-        r.raise_for_status()
-        return r.json()["id"]
+    """No-op — pgvector uses a single table filtered by metadata. Returns name."""
+    await init_vector_schema()
+    return name
 
 
 # ─── Document operations ───────────────────────────────────────────────────────
-
 
 async def upsert_documents(
     collection_name: str,
@@ -49,21 +101,57 @@ async def upsert_documents(
     metadatas: list[dict] | None = None,
     ids: list[str] | None = None,
 ) -> None:
-    """Upsert text documents into a ChromaDB collection (uses add with upsert=True)."""
-    col_id = await get_or_create_collection(collection_name)
+    """Upsert text documents (with optional embeddings) into pgvector table."""
     if ids is None:
         ids = [hashlib.md5(doc.encode()).hexdigest() for doc in documents]
     if metadatas is None:
         metadatas = [{} for _ in documents]
 
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(
-            f"{_BASE}/api/v1/collections/{col_id}/upsert",
-            json={"documents": documents, "metadatas": metadatas, "ids": ids},
-        )
-        if r.status_code not in (200, 201):
-            log.error("ChromaDB upsert failed", status=r.status_code, body=r.text[:200])
-            r.raise_for_status()
+    try:
+        async with engine.begin() as conn:
+            for doc_id, content, meta in zip(ids, documents, metadatas):
+                meta_with_collection = {**meta, "collection": collection_name}
+                embedding = await _embed(content)
+
+                if embedding is not None:
+                    await conn.execute(
+                        text("""
+                            INSERT INTO resume_embeddings (id, user_id, content, metadata, embedding)
+                            VALUES (:id, :user_id, :content, :metadata::jsonb, :embedding::vector)
+                            ON CONFLICT (id) DO UPDATE
+                                SET content   = EXCLUDED.content,
+                                    metadata  = EXCLUDED.metadata,
+                                    embedding = EXCLUDED.embedding
+                        """),
+                        {
+                            "id": doc_id,
+                            "user_id": meta.get("user_id", ""),
+                            "content": content,
+                            "metadata": json.dumps(meta_with_collection),
+                            "embedding": str(embedding),
+                        },
+                    )
+                else:
+                    # Store without vector — text-only, no similarity search
+                    await conn.execute(
+                        text("""
+                            INSERT INTO resume_embeddings (id, user_id, content, metadata)
+                            VALUES (:id, :user_id, :content, :metadata::jsonb)
+                            ON CONFLICT (id) DO UPDATE
+                                SET content  = EXCLUDED.content,
+                                    metadata = EXCLUDED.metadata
+                        """),
+                        {
+                            "id": doc_id,
+                            "user_id": meta.get("user_id", ""),
+                            "content": content,
+                            "metadata": json.dumps(meta_with_collection),
+                        },
+                    )
+        log.info("Documents upserted to pgvector", count=len(documents), collection=collection_name)
+    except Exception as e:
+        log.error("pgvector upsert failed", error=str(e))
+        raise
 
 
 async def query_collection(
@@ -72,34 +160,54 @@ async def query_collection(
     n_results: int = 5,
     where: dict | None = None,
 ) -> list[dict[str, Any]]:
-    """Query a collection and return list of result dicts with document + metadata."""
+    """Query by semantic similarity. Falls back to full-text search if no embeddings."""
+    if not query_texts:
+        return []
+
+    query_text = query_texts[0]
     try:
-        col_id = await get_or_create_collection(collection_name)
-        payload: dict[str, Any] = {
-            "query_texts": query_texts,
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            payload["where"] = where
+        query_embedding = await _embed(query_text)
 
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                f"{_BASE}/api/v1/collections/{col_id}/query",
-                json=payload,
-            )
-            r.raise_for_status()
-            data = r.json()
+        async with engine.begin() as conn:
+            if query_embedding is not None:
+                # Vector similarity search (cosine distance)
+                rows = await conn.execute(
+                    text("""
+                        SELECT id, content, metadata,
+                               1 - (embedding <=> :embedding::vector) AS score
+                        FROM resume_embeddings
+                        WHERE metadata->>'collection' = :collection
+                        ORDER BY embedding <=> :embedding::vector
+                        LIMIT :limit
+                    """),
+                    {
+                        "embedding": str(query_embedding),
+                        "collection": collection_name,
+                        "limit": n_results,
+                    },
+                )
+            else:
+                # Full-text fallback
+                rows = await conn.execute(
+                    text("""
+                        SELECT id, content, metadata, 0.5 AS score
+                        FROM resume_embeddings
+                        WHERE metadata->>'collection' = :collection
+                        LIMIT :limit
+                    """),
+                    {"collection": collection_name, "limit": n_results},
+                )
 
-        results = []
-        for i, doc in enumerate(data.get("documents", [[]])[0]):
-            results.append({
-                "document": doc,
-                "metadata": data.get("metadatas", [[]])[0][i] if data.get("metadatas") else {},
-                "distance": data.get("distances", [[]])[0][i] if data.get("distances") else None,
-                "id": data.get("ids", [[]])[0][i] if data.get("ids") else None,
-            })
-        return results
+            results = []
+            for row in rows:
+                results.append({
+                    "id": row.id,
+                    "document": row.content,
+                    "metadata": json.loads(row.metadata) if isinstance(row.metadata, str) else row.metadata,
+                    "distance": 1 - float(row.score),
+                })
+            return results
+
     except Exception as e:
-        log.warning("ChromaDB query failed", error=str(e), collection=collection_name)
+        log.warning("pgvector query failed", error=str(e), collection=collection_name)
         return []

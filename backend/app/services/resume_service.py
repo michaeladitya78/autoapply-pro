@@ -1,6 +1,11 @@
 """
 Resume service — parse, store, and retrieve resumes.
-Supports PDF and DOCX. Parsed text stored in DB + vectorized in ChromaDB.
+Supports PDF and DOCX. Parsed text stored in DB + vectorized via pgvector.
+
+Changes from local version:
+  - `ollama_extract_keywords` replaced with `extract_keywords` (Claude-backed)
+  - ChromaDB upsert replaced with pgvector via the same `upsert_documents` call
+  - File URL now uses S3 key when AWS is configured, else 'upload://<filename>'
 """
 from __future__ import annotations
 import io
@@ -11,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.user import Resume
-from app.agents.llm import claude_parse_resume, ollama_extract_keywords
+# extract_keywords now uses Claude as primary (Ollama removed)
+from app.agents.llm import claude_parse_resume, extract_keywords
 from app.core.chroma_client import upsert_documents
 
 log = structlog.get_logger()
@@ -48,7 +54,7 @@ async def process_resume_upload(
 ) -> Resume:
     """
     Parse uploaded resume file → extract text → Claude structured parse
-    → store in DB → vectorize in ChromaDB.
+    → store in DB → vectorize in pgvector.
     """
     # Extract raw text
     if "pdf" in content_type or filename.lower().endswith(".pdf"):
@@ -71,12 +77,19 @@ async def process_resume_upload(
     for r in prev:
         r.is_active = False
 
+    # Build file URL — use S3 key if configured, else simple identifier
+    from app.core.config import settings
+    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+        file_url = f"s3://{settings.AWS_BUCKET_NAME}/resumes/{user_id}/{filename}"
+    else:
+        file_url = f"upload://{filename}"
+
     # Create new resume record
     resume_id = str(uuid.uuid4())
     resume = Resume(
         id=resume_id,
         user_id=user_id,
-        file_url=f"local://{filename}",   # S3 URL in prod
+        file_url=file_url,
         filename=filename,
         parsed_content=raw_text,
         structured_data=structured,
@@ -87,9 +100,9 @@ async def process_resume_upload(
     db.add(resume)
     await db.flush()
 
-    # Vectorize in ChromaDB for similarity search (fire-and-forget)
+    # Vectorize in pgvector for similarity search (fire-and-forget — non-fatal)
     try:
-        keywords = await ollama_extract_keywords(raw_text)
+        keywords = await extract_keywords(raw_text)
         combined = raw_text + "\nKeywords: " + ", ".join(keywords)
         await upsert_documents(
             collection_name=f"resumes_{user_id}",
@@ -98,8 +111,13 @@ async def process_resume_upload(
             ids=[resume_id],
         )
     except Exception as e:
-        log.warning("ChromaDB vectorization failed (non-fatal)", error=str(e))
+        log.warning("pgvector vectorization failed (non-fatal)", error=str(e))
 
-    log.info("Resume processed", user_id=user_id, resume_id=resume_id,
-             chars=len(raw_text), has_structured=bool(structured))
+    log.info(
+        "Resume processed",
+        user_id=user_id,
+        resume_id=resume_id,
+        chars=len(raw_text),
+        has_structured=bool(structured),
+    )
     return resume

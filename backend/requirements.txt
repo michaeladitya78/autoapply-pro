@@ -4,51 +4,52 @@ uvicorn[standard]==0.32.1
 pydantic==2.9.2
 pydantic-settings==2.6.1
 
-# ─── Database ─────────────────────────────────────────────────────────────────
+# ─── Database (Supabase / PostgreSQL + pgvector) ──────────────────────────────
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 alembic==1.14.0
 psycopg2-binary==2.9.10
 
-# ─── Task Queue ───────────────────────────────────────────────────────────────
+# ─── Task Queue (Upstash Redis — drop-in compatible) ─────────────────────────
 celery==5.4.0
 redis==5.2.0
-flower==2.0.1
+# flower==2.0.1  # Uncomment to enable Celery monitoring UI on Railway
 
-# ─── AI / LLMs ────────────────────────────────────────────────────────────────
-anthropic>=0.40.0          # Claude API
+# ─── AI / LLMs (Claude API — the only LLM in cloud deployment) ───────────────
+anthropic>=0.40.0          # Claude API + voyage-3 embeddings
 langchain==0.3.9
 langchain-anthropic==0.3.3
 langgraph==0.2.55
-# crewai not installed — project uses LangGraph directly
-# chromadb runs in Docker — we call its HTTP API via httpx (no local install needed)
-# sentence-transformers requires C++ build tools on Windows — handled in Docker image only
 tiktoken==0.8.0
-openai==1.57.0             # for Ollama OpenAI-compat API
+# openai removed: Ollama's OpenAI-compat shim is not used in cloud deployment
 
-# ─── Browser Automation ───────────────────────────────────────────────────────
+# ─── Browser Automation (headless Chromium on Railway) ───────────────────────
 playwright==1.49.0
 playwright-stealth==1.0.6
+# Note: `playwright install chromium --with-deps` runs as a Railway build command
 
 # ─── Auth & Security ──────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 svix==1.31.0            # Clerk webhook verification
-hvac==2.3.0             # HashiCorp Vault client
+# hvac removed: HashiCorp Vault replaced by Supabase Vault REST API
 cryptography==43.0.3
 bcrypt==4.2.1
+
+# ─── Payments (Stripe) ───────────────────────────────────────────────────────
+stripe>=11.0.0
+
+# ─── Email (Resend — replaces aiosmtplib / Gmail SMTP) ───────────────────────
+# Resend uses plain httpx — no extra SDK needed (already in HTTP section)
+# aiosmtplib removed: cloud email via Resend REST API
+# google-auth-oauthlib removed: Gmail SMTP OAuth not needed with Resend
 
 # ─── File Processing ──────────────────────────────────────────────────────────
 python-multipart==0.0.18
 pypdf2==3.0.1
 python-docx==1.1.2
-boto3==1.35.80          # S3 uploads
+boto3==1.35.80          # S3 uploads (optional — set AWS_* env vars to enable)
 
-# ─── Email ────────────────────────────────────────────────────────────────────
-aiosmtplib==3.0.2
-google-auth-oauthlib==1.2.1
-google-api-python-client==2.154.0
-
-# ─── HTTP & Scraping ──────────────────────────────────────────────────────────
+# ─── HTTP & Networking ────────────────────────────────────────────────────────
 httpx==0.28.1
 aiohttp==3.11.10
 beautifulsoup4==4.12.3

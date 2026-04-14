@@ -13,19 +13,31 @@ from app.core.websocket_manager import ws_manager
 from app.api.v1 import (
     auth, users, accounts, agent, applications,
     outreach, dashboard, flags, resume, webhook,
-    career_ops,
+    career_ops, stripe_payments,
 )
 
 log = structlog.get_logger()
 
+
+import asyncio
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
     log.info("Starting AutoApply Pro", env=settings.ENVIRONMENT)
     await init_db()
+    
+    # Start Redis Pub/Sub listener for WebSockets
+    pubsub_task = asyncio.create_task(ws_manager.start_redis_listener())
+    
     yield
+    
     log.info("Shutting down AutoApply Pro")
+    pubsub_task.cancel()
+    try:
+        await pubsub_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(
@@ -59,6 +71,7 @@ app.include_router(outreach.router, prefix="/api/outreach", tags=["outreach"])
 app.include_router(dashboard.router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(flags.router, prefix="/api/flags", tags=["flags"])
 app.include_router(career_ops.router, prefix="/api/career-ops", tags=["career-ops"])
+app.include_router(stripe_payments.router, prefix="/api/billing", tags=["billing"])
 
 # WebSocket for real-time updates
 from fastapi import WebSocket, WebSocketDisconnect

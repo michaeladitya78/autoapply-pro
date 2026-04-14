@@ -7,11 +7,17 @@ from app.core.config import settings
 
 log = structlog.get_logger()
 
+# Upstash Redis URL format:  rediss://default:[token]@[host].upstash.io:6380
+# Note the "rediss://" (double-s) for TLS — required by Upstash.
+# redis-py 5.x supports TLS natively, no extra config needed.
 celery_app = Celery(
     "autoapply",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
-    include=["app.workers.tasks"],
+    include=[
+        "app.workers.tasks",
+        "app.workers.career_ops_tasks",
+    ],
 )
 
 celery_app.conf.update(
