@@ -21,20 +21,18 @@ const nextConfig: NextConfig = {
   // NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY — set in .env.local / Vercel env vars
   // CLERK_SECRET_KEY                  — set in .env.local / Vercel env vars
   // NEXT_PUBLIC_CLERK_SIGN_IN_URL     — /sign-in
-  // NEXT_PUBLIC_CLERK_SIGN_UP_URL     — /sign-up
-  // NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL — /dashboard
-  // NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL — /onboarding  (or /dashboard)
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
   typescript: {
     ignoreBuildErrors: true,
   },
   async rewrites() {
+    let apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+    if (!apiUrl.startsWith("http://") && !apiUrl.startsWith("https://")) {
+      apiUrl = `https://${apiUrl}`;
+    }
     return [
       {
         source: "/api/:path*",
-        destination: `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080"}/api/:path*`,
+        destination: `${apiUrl}/api/:path*`,
       },
     ];
   },
