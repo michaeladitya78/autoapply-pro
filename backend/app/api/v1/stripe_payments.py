@@ -6,7 +6,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.core.config import settings
-from app.core.auth import get_current_user_id
+
 
 log = structlog.get_logger()
 
