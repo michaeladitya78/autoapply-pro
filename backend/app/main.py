@@ -21,23 +21,39 @@ log = structlog.get_logger()
 
 import asyncio
 
+startup_error = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
+    global startup_error
     log.info("Starting AutoApply Pro", env=settings.ENVIRONMENT)
-    await init_db()
+    try:
+        await init_db()
+    except Exception as e:
+        import traceback
+        startup_error = traceback.format_exc()
+        log.error("init_db failed", error=startup_error)
     
-    # Start Redis Pub/Sub listener for WebSockets
-    pubsub_task = asyncio.create_task(ws_manager.start_redis_listener())
-    
+    pubsub_task = None
+    try:
+        # Start Redis Pub/Sub listener for WebSockets
+        pubsub_task = asyncio.create_task(ws_manager.start_redis_listener())
+    except Exception as e:
+        import traceback
+        if startup_error is None: startup_error = traceback.format_exc()
+        else: startup_error += "\n\n" + traceback.format_exc()
+        log.error("pubsub failed", error=str(e))
+        
     yield
     
     log.info("Shutting down AutoApply Pro")
-    pubsub_task.cancel()
-    try:
-        await pubsub_task
-    except asyncio.CancelledError:
-        pass
+    if pubsub_task:
+        pubsub_task.cancel()
+        try:
+            await pubsub_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
@@ -92,4 +108,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
 @app.get("/health")
 async def health_check():
+    global startup_error
+    if startup_error:
+        return {"status": "error", "service": "autoapply-pro", "error": startup_error}
     return {"status": "ok", "service": "autoapply-pro"}
