@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# System deps for Playwright
+# System deps for Playwright + PostgreSQL client libs
 RUN apt-get update && apt-get install -y \
     curl wget gnupg ca-certificates \
     libglib2.0-0 libnss3 libnspr4 libdbus-1-3 \
@@ -15,10 +15,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers
+# Install Playwright browsers (Chromium only to keep image size manageable)
 RUN playwright install chromium --with-deps
 
 COPY . .
 
+# Use $PORT env var from Railway (defaults to 8080)
 EXPOSE 8080
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
